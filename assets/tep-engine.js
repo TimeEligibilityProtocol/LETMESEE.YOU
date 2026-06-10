@@ -11,8 +11,14 @@ TEP thresholds from K74 WhitePaper v3:
   high=0.65 → gradR=0.179 (stable history)  → NOW
   viability=96% at this configuration (best of 27 tested).
 
-Remote compute: POST /compute-cr on TEP server (Render).
-Falls back to local JS computation if server is unreachable.
+Eye, sleep, body signals are INPUTS that inform CR.
+They are not independent gates — only CR gates action.
+
+bl (body load) is computed from the same inputs as CR.
+It is contextual information only — not a decision gate.
+
+Remote compute: POST /compute-cr on letmeseeyou-serwer.onrender.com
+Falls back to local compute() when server is unreachable.
 
 Non-medical wellness guidance only. Not a clinical device.
 */
@@ -20,12 +26,7 @@ Non-medical wellness guidance only. Not a clinical device.
 (function(){
   const clamp = (v, min=0, max=1) => Math.max(min, Math.min(max, v));
 
-  // TEP server URL — update after Render deployment
-  const TEP_SERVER = 'https://letmeseeyou-serwer.onrender.com';
-
-  // ── Local compute fallback ──
-  // Used when server is unreachable. Identical formula to server.
-
+  // ── CR(h_t) — canonical formula from TEPMat v1.1 ──
   function crFromRMSSD(rmssd){
     return clamp((Math.log(Math.max(rmssd, 1)) - 2.0) / 2.5);
   }
@@ -54,16 +55,23 @@ Non-medical wellness guidance only. Not a clinical device.
     return clamp(signals.filter(Boolean).length / 5);
   }
 
-  function computeLocal(input){
+  function trajectory(hist){
+    if(!hist || hist.length < 8) return 'flat';
+    const s = hist[hist.length-1] - hist[hist.length-8];
+    return s > 0.05 ? 'up' : s < -0.05 ? 'down' : 'flat';
+  }
+
+  // ── Local compute (sync) — used as fallback when server unreachable ──
+  function compute(input){
     const rmssd   = Number(input.rmssd  ?? 48);
     const sleep   = Number(input.sleep  ?? 7);
     const eye     = input.eye    || {};
     const signals = Array.isArray(input.signals) ? input.signals : [];
 
-    const crHRV    = crFromRMSSD(rmssd);
-    const eyeC     = eyeContribution(eye);
-    const sleepC   = sleepContribution(sleep);
-    const bodyLoad = bodySignalContribution(signals);
+    const crHRV   = crFromRMSSD(rmssd);
+    const eyeC    = eyeContribution(eye);
+    const sleepC  = sleepContribution(sleep);
+    const bodyLoad= bodySignalContribution(signals);
 
     const cr = clamp(
       crHRV  * 0.42 +
@@ -92,40 +100,27 @@ Non-medical wellness guidance only. Not a clinical device.
           ? 'System is stabilising. Smaller, reversible effort only.'
           : 'Regulation below threshold. Rest and recovery first.';
 
-    return { cr, crHRV, eyeC, sleepC, bodyLoad, bodyLoadPct, state,
-             now: state==='NOW', partial: state==='PARTIAL', notYet: state==='NOT_YET',
-             contextNote, explanation: contextNote };
+    return {
+      cr, crHRV, eyeC, sleepC, bodyLoad, bodyLoadPct, state,
+      now: state === 'NOW', partial: state === 'PARTIAL', notYet: state === 'NOT_YET',
+      contextNote, explanation: contextNote
+    };
   }
 
-  // ── Remote compute — calls TEP server ──
-  // Falls back to local if server is unavailable or slow (>3s timeout).
-  async function compute(input){
+  // ── Remote compute — calls TEP server, falls back to local ──
+  async function computeRemote(rmssd, sleep, signals, eye){
     try {
-      const ctrl = new AbortController();
-      const tid  = setTimeout(() => ctrl.abort(), 3000);
-      const res  = await fetch(TEP_SERVER + '/compute-cr', {
+      const res = await fetch('https://letmeseeyou-serwer.onrender.com/compute-cr', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          rmssd:   input.rmssd   ?? 48,
-          sleep:   input.sleep   ?? 7,
-          signals: input.signals ?? [],
-          eye:     input.eye     ?? {}
-        }),
-        signal: ctrl.signal
+        body:    JSON.stringify({ rmssd, sleep, signals, eye })
       });
-      clearTimeout(tid);
-      if(res.ok) return await res.json();
+      if(!res.ok) throw new Error('Server error');
+      return await res.json();
     } catch(e) {
-      // Server unreachable — fall through to local
+      // Server unreachable — fall back to local computation
+      return compute({ rmssd, sleep, signals, eye });
     }
-    return computeLocal(input);
-  }
-
-  function trajectory(hist){
-    if(!hist || hist.length < 8) return 'flat';
-    const s = hist[hist.length-1] - hist[hist.length-8];
-    return s > 0.05 ? 'up' : s < -0.05 ? 'down' : 'flat';
   }
 
   function readSessionSignals(){
@@ -166,7 +161,7 @@ Non-medical wellness guidance only. Not a clinical device.
       }
     }
 
-    const result = await compute({ rmssd, sleep, eye, signals });
+    const result = await computeRemote(rmssd, sleep, signals, eye);
     result.hrvSource = hrvSource;
 
     if(hrvSource === 'camera-estimated' && _rppg){
@@ -208,8 +203,8 @@ Non-medical wellness guidance only. Not a clinical device.
     return result;
   }
 
-  async function getAgentState(){
-    if(window.S) await applyToDashboard();
+  function getAgentState(){
+    if(window.S) applyToDashboard();
     const eye = window.LMS_EYE ? window.LMS_EYE.getMetrics() : null;
     const s   = window.S || {};
     return {
